@@ -1,0 +1,490 @@
+{
+  "name": "Agente IA Médico - RAG com Anti-Alucinação (Community)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-chat",
+      "name": "Webhook - Receber Consulta",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 300],
+      "webhookId": "agente-medico-chat"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "upload-pdf",
+        "options": {}
+      },
+      "id": "webhook-upload",
+      "name": "Webhook - Upload PDF",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [250, 100],
+      "webhookId": "upload-medical-pdf"
+    },
+    {
+      "parameters": {
+        "mode": "jsonToBinary",
+        "options": {}
+      },
+      "id": "convert-to-binary",
+      "name": "Converter para Binary",
+      "type": "n8n-nodes-base.moveBinaryData",
+      "typeVersion": 1,
+      "position": [450, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extração de texto do PDF usando pdf-parse\nconst PDFParser = require('pdf-parse');\n\nconst items = [];\n\nfor (const item of $input.all()) {\n  const binaryData = await this.helpers.getBinaryDataBuffer(item.binary.data);\n  const pdfData = await PDFParser(binaryData);\n  \n  // Divide o texto em páginas\n  const pages = pdfData.text.split('\\f');\n  \n  pages.forEach((pageText, index) => {\n    if (pageText.trim()) {\n      items.push({\n        json: {\n          text: pageText.trim(),\n          page: index + 1,\n          totalPages: pages.length\n        }\n      });\n    }\n  });\n}\n\nreturn items;"
+      },
+      "id": "pdf-extract",
+      "name": "Extrair Texto do PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 100],
+      "notesInFlow": true,
+      "notes": "Requer: npm install pdf-parse"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Chunking inteligente com overlap\nconst chunkSize = 1000;\nconst chunkOverlap = 200;\n\nconst items = [];\n\nfor (const item of $input.all()) {\n  const text = item.json.text;\n  const page = item.json.page;\n  \n  let start = 0;\n  let chunkIndex = 0;\n  \n  while (start < text.length) {\n    const end = Math.min(start + chunkSize, text.length);\n    const chunk = text.substring(start, end);\n    \n    items.push({\n      json: {\n        content: chunk,\n        page: page,\n        chunkIndex: chunkIndex,\n        metadata: {\n          page: page,\n          chunk: chunkIndex,\n          charStart: start,\n          charEnd: end\n        }\n      }\n    });\n    \n    start += (chunkSize - chunkOverlap);\n    chunkIndex++;\n  }\n}\n\nreturn items;"
+      },
+      "id": "chunk-text",
+      "name": "Chunking Inteligente",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 100]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "requestMethod": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "options": {},
+        "bodyParametersJson": "={\n  \"input\": \"{{ $json.content }}\",\n  \"model\": \"text-embedding-3-small\"\n}"
+      },
+      "id": "embeddings-openai",
+      "name": "Gerar Embeddings (OpenAI)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 100],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "openai-header",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Preparar dados para Pinecone\nconst items = [];\n\nfor (const item of $input.all()) {\n  const embedding = item.json.data[0].embedding;\n  const metadata = $('Chunking Inteligente').item(item.index).json.metadata;\n  const content = $('Chunking Inteligente').item(item.index).json.content;\n  \n  items.push({\n    json: {\n      id: `chunk-${metadata.page}-${metadata.chunk}`,\n      values: embedding,\n      metadata: {\n        ...metadata,\n        text: content\n      }\n    }\n  });\n}\n\nreturn items;"
+      },
+      "id": "prepare-pinecone",
+      "name": "Preparar para Pinecone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 100]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "requestMethod": "POST",
+        "url": "https://YOUR-INDEX.pinecone.io/vectors/upsert",
+        "options": {},
+        "bodyParametersJson": "={\n  \"vectors\": [\n    {\n      \"id\": \"{{ $json.id }}\",\n      \"values\": {{ JSON.stringify($json.values) }},\n      \"metadata\": {{ JSON.stringify($json.metadata) }}\n    }\n  ],\n  \"namespace\": \"medical-ebook\"\n}"
+      },
+      "id": "pinecone-store",
+      "name": "Armazenar no Pinecone",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 100],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "pinecone-api",
+          "name": "Pinecone API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "findMany",
+        "collection": "users",
+        "options": {
+          "queryParameters": "={\n  \"user_id\": \"{{ $json.body.user_id }}\"\n}"
+        }
+      },
+      "id": "get-user-history",
+      "name": "Buscar Histórico",
+      "type": "n8n-nodes-base.mongodb",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "mongoDb": {
+          "id": "mongodb-cred",
+          "name": "MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gerar embedding da pergunta\nconst question = $input.first().json.body.question;\n\nreturn [{\n  json: {\n    question: question,\n    user_id: $input.first().json.body.user_id,\n    session_id: $input.first().json.body.session_id || 'default'\n  }\n}];"
+      },
+      "id": "prepare-question",
+      "name": "Preparar Pergunta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "requestMethod": "POST",
+        "url": "https://api.openai.com/v1/embeddings",
+        "options": {},
+        "bodyParametersJson": "={\n  \"input\": \"{{ $json.question }}\",\n  \"model\": \"text-embedding-3-small\"\n}"
+      },
+      "id": "question-embedding",
+      "name": "Embedding da Pergunta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [850, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "openai-header",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "requestMethod": "POST",
+        "url": "https://YOUR-INDEX.pinecone.io/query",
+        "options": {},
+        "bodyParametersJson": "={\n  \"vector\": {{ JSON.stringify($json.data[0].embedding) }},\n  \"topK\": 5,\n  \"includeMetadata\": true,\n  \"namespace\": \"medical-ebook\"\n}"
+      },
+      "id": "similarity-search",
+      "name": "Busca Semântica",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "pinecone-api",
+          "name": "Pinecone API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validação Anti-Alucinação\nconst question = $('Preparar Pergunta').item.json.question;\nconst results = $input.first().json.matches || [];\n\n// Verifica se há documentos relevantes\nif (!results || results.length === 0) {\n  return [{\n    json: {\n      response: \"Desculpe, não encontrei informações sobre isso no ebook médico. Por favor, reformule sua pergunta ou consulte diretamente o material.\",\n      confidence: 0,\n      sources: [],\n      hallucination_risk: \"HIGH\",\n      error: true,\n      validated: false\n    }\n  }];\n}\n\n// Calcula score de confiança\nconst avgScore = results.reduce((sum, doc) => sum + (doc.score || 0), 0) / results.length;\n\n// Threshold de confiança: 0.7\nif (avgScore < 0.7) {\n  return [{\n    json: {\n      response: \"As informações encontradas têm baixa relevância. Recomendo reformular a pergunta de forma mais específica.\",\n      confidence: avgScore,\n      sources: [],\n      hallucination_risk: \"MEDIUM\",\n      error: true,\n      validated: false\n    }\n  }];\n}\n\n// Prepara contexto para LLM\nconst context = results.map(doc => ({\n  content: doc.metadata.text,\n  page: doc.metadata.page,\n  chunk: doc.metadata.chunk,\n  score: doc.score\n}));\n\nconst contextText = context.map((c, i) => \n  `[Fonte ${i+1} - Página ${c.page}]:\\n${c.content}`\n).join('\\n\\n');\n\nreturn [{\n  json: {\n    question,\n    context: contextText,\n    contextArray: context,\n    confidence: avgScore,\n    hallucination_risk: \"LOW\",\n    validated: true,\n    error: false\n  }\n}];"
+      },
+      "id": "validation-logic",
+      "name": "Validação Anti-Alucinação",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "requestMethod": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "options": {},
+        "bodyParametersJson": "={\n  \"model\": \"gpt-4-turbo-preview\",\n  \"temperature\": 0.1,\n  \"max_tokens\": 800,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"Você é um assistente médico especializado. REGRAS CRÍTICAS:\\n\\n1. RESPONDA APENAS com informações PRESENTES no contexto fornecido\\n2. SEMPRE cite a página de onde tirou a informação usando o formato [Página X]\\n3. Se a informação NÃO estiver no contexto, diga: 'Não encontrei essa informação no material fornecido'\\n4. NUNCA invente, infira ou extrapole informações médicas\\n5. Use exatamente os termos e dados do material original\\n6. Em caso de dúvida, seja conservador e peça mais detalhes\\n\\nFormato da resposta:\\n- Resposta clara e objetiva\\n- Fonte: [Página X]\\n- Nível de confiança: [Alto/Médio/Baixo]\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"CONTEXTO DO EBOOK:\\n{{ $json.context }}\\n\\nPERGUNTA DO MÉDICO:\\n{{ $json.question }}\\n\\nHISTÓRICO DA CONVERSA:\\n{{ $('Buscar Histórico').item.json[0]?.history || 'Nenhum histórico anterior' }}\"\n    }\n  ]\n}"
+      },
+      "id": "llm-response",
+      "name": "LLM - Gerar Resposta",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "openai-header",
+          "name": "OpenAI API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pós-processamento e verificação final\nconst llmResponse = $input.first().json.choices[0].message.content;\nconst validation = $('Validação Anti-Alucinação').item.json;\n\n// Se já teve erro na validação, retorna erro\nif (validation.error) {\n  return [{\n    json: {\n      ...validation,\n      timestamp: new Date().toISOString()\n    }\n  }];\n}\n\n// Extrai citações da resposta\nconst citations = [];\nconst citationRegex = /\\[Página (\\d+)\\]/g;\nlet match;\n\nwhile ((match = citationRegex.exec(llmResponse)) !== null) {\n  citations.push({\n    page: parseInt(match[1])\n  });\n}\n\n// Verifica se há citações (obrigatório)\nif (citations.length === 0) {\n  return [{\n    json: {\n      response: \"ERRO: Resposta sem citação adequada. Por favor, reformule a pergunta.\",\n      error: true,\n      reason: \"missing_citations\",\n      original_response: llmResponse,\n      validated: false\n    }\n  }];\n}\n\n// Verifica frases suspeitas de alucinação\nconst suspiciousPhrases = [\n  \"eu acho\",\n  \"provavelmente\",\n  \"pode ser\",\n  \"geralmente\",\n  \"na minha experiência\",\n  \"é comum que\"\n];\n\nconst hasSuspiciousContent = suspiciousPhrases.some(phrase => \n  llmResponse.toLowerCase().includes(phrase)\n);\n\nif (hasSuspiciousContent) {\n  return [{\n    json: {\n      response: \"AVISO: Resposta contém linguagem não assertiva. Reformulando...\",\n      error: true,\n      reason: \"suspicious_language\",\n      original_response: llmResponse,\n      validated: false\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    response: llmResponse,\n    citations: citations,\n    confidence: validation.confidence,\n    sources: validation.contextArray,\n    validated: true,\n    error: false,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "post-validation",
+      "name": "Validação Final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.error }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "error-check",
+      "name": "Verificar Erros",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "conversations",
+        "fields": "={\n  \"user_id\": \"{{ $('Preparar Pergunta').item.json.user_id }}\",\n  \"question\": \"{{ $('Preparar Pergunta').item.json.question }}\",\n  \"response\": \"{{ $json.response }}\",\n  \"citations\": {{ JSON.stringify($json.citations) }},\n  \"confidence\": {{ $json.confidence }},\n  \"timestamp\": \"{{ $json.timestamp }}\",\n  \"session_id\": \"{{ $('Preparar Pergunta').item.json.session_id }}\",\n  \"validated\": {{ $json.validated }}\n}"
+      },
+      "id": "save-conversation",
+      "name": "Salvar Histórico",
+      "type": "n8n-nodes-base.mongodb",
+      "typeVersion": 1,
+      "position": [2050, 250],
+      "credentials": {
+        "mongoDb": {
+          "id": "mongodb-cred",
+          "name": "MongoDB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "response-success",
+      "name": "Responder Sucesso",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2250, 250]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "responseCode": 400,
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          }
+        }
+      },
+      "id": "response-error",
+      "name": "Responder Erro",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2250, 350]
+    }
+  ],
+  "connections": {
+    "Webhook - Upload PDF": {
+      "main": [
+        [
+          {
+            "node": "Converter para Binary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Converter para Binary": {
+      "main": [
+        [
+          {
+            "node": "Extrair Texto do PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrair Texto do PDF": {
+      "main": [
+        [
+          {
+            "node": "Chunking Inteligente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunking Inteligente": {
+      "main": [
+        [
+          {
+            "node": "Gerar Embeddings (OpenAI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gerar Embeddings (OpenAI)": {
+      "main": [
+        [
+          {
+            "node": "Preparar para Pinecone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar para Pinecone": {
+      "main": [
+        [
+          {
+            "node": "Armazenar no Pinecone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook - Receber Consulta": {
+      "main": [
+        [
+          {
+            "node": "Buscar Histórico",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Preparar Pergunta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Pergunta": {
+      "main": [
+        [
+          {
+            "node": "Embedding da Pergunta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding da Pergunta": {
+      "main": [
+        [
+          {
+            "node": "Busca Semântica",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Busca Semântica": {
+      "main": [
+        [
+          {
+            "node": "Validação Anti-Alucinação",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validação Anti-Alucinação": {
+      "main": [
+        [
+          {
+            "node": "LLM - Gerar Resposta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM - Gerar Resposta": {
+      "main": [
+        [
+          {
+            "node": "Validação Final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validação Final": {
+      "main": [
+        [
+          {
+            "node": "Verificar Erros",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar Erros": {
+      "main": [
+        [
+          {
+            "node": "Salvar Histórico",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Responder Erro",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Salvar Histórico": {
+      "main": [
+        [
+          {
+            "node": "Responder Sucesso",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "meta": {
+    "instanceId": "medical-ai-agent-community"
+  }
+}
